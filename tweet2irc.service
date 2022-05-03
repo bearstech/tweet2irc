@@ -1,0 +1,12 @@
+[Unit]
+Description=Twitter to IRC Bot
+After=network.target
+
+[Service]
+User=tweety
+Group=tweety
+WorkingDirectory=/home/tweety/tweet2irc
+ExecStart=/home/tweety/tweet2irc/tweet2irc my.cfg
+
+[Install]
+WantedBy=multi-user.target

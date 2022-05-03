@@ -1,0 +1,217 @@
+#!/usr/bin/env perl
+
+# An IRC bot which listens for Twitter keywords and shows them in an IRC channel.
+#
+# Debian/Ubuntu dependencies : apt-get install libanyevent-http-perl libanyevent-irc-perl
+
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the Affero GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+
+# (c) 2022 Bearstech - https://bearstech.com/
+
+use AnyEvent;
+use AnyEvent::HTTP;
+use AnyEvent::IRC::Client;
+use JSON;
+use Encode;
+use Time::HiRes;
+use List::Util qw/min/;
+use warnings;
+use strict;
+
+# Default configuration values
+my %conf = (
+  bearer     => 'please-define-bearer',
+  irc_server => 'your.irc.server',
+  irc_port   => 6667,
+  irc_tls    => 0,
+  irc_pass   => '',
+  irc_nick   => 'your_nick',
+  irc_chan   => '#your_chan',
+  rate_limit => 60,  # In message/min
+);
+my %history;  # Message hash for de-dupe
+my %limit = (last => 0, bucket => 0);
+my $end = AnyEvent->condvar;
+my $irc = new AnyEvent::IRC::Client;
+
+
+sub twitter_call {
+  my ($endpoint, $payload, $cb) = @_;
+  my $url = 'https://api.twitter.com' . $endpoint;
+
+  if (defined $payload) {
+    http_post $url, $payload, timeout => 3, headers => { 'Authorization' => "Bearer $conf{bearer}", 'Content-Type' => 'application/json' }, $cb;
+  } else {
+    http_get $url, timeout => 3, headers => { 'Authorization' => "Bearer $conf{bearer}" }, $cb;
+  }
+}
+
+# This is a looong request that we restart when it times out.
+sub twitter_stream {
+  http_get 'https://api.twitter.com/2/tweets/search/stream',
+    sessionid => 42,  # Make sure it's a distinct TCP session from other API calls
+    timeout => 600,
+    headers => { 'Authorization' => "Bearer $conf{bearer}" },
+    want_body_handle => 1,
+    sub {
+      my ($handle, $hdr) = @_;
+      $handle->on_error(sub {
+        print "Stream error (".$_[2]."), retrying...\n";
+        twitter_stream();
+      });
+      $handle->on_read(sub {
+        $handle->push_read(line => sub {
+	  my $line = $_[1];
+	  return if $line !~ /{/; # Only keep lines with a JSON object
+
+          # Opportunistic message de-dupe cache flush
+          my $now = time;
+          while (my ($k, $t) = each %history) {
+            delete $history{$k} if $now - $t >= 86400;
+          }
+
+	  my $tweet = decode_json($line);
+          my $msg   = $tweet->{data}{text};
+          return if defined $history{$msg};  # Already relayed
+
+          $limit{bucket} += ($now - $limit{last})*$conf{rate_limit}/60;  # Fill token bucket
+          $limit{bucket} = min $limit{bucket}, $conf{rate_limit}/10;     # Set bucket size (burst) to 10% of rate_limit
+          $limit{last} = $now;
+	  return if $limit{bucket} < 1;  # Skipping because of rate limit
+
+          irc_say(Encode::encode_utf8($msg));
+          $history{$msg} = $now;
+          $limit{bucket}--;
+        });
+      });
+    };
+}
+
+
+#
+# Bot commands
+#
+
+sub cmd_help {
+  irc_say($_) for
+    'add <rule spec>',
+    'del <rule id>',
+    'get',
+    '(see https://developer.twitter.com/en/docs/twitter-api/tweets/filtered-stream/quick-start)';
+}
+
+sub cmd_unknown {
+  irc_say("Unkown command, try 'help'");
+}
+
+sub cmd_get_rules {
+  twitter_call '/2/tweets/search/stream/rules', undef, sub {
+    my $res = decode_json($_[0]);
+    if (!defined $res->{data}) {
+      irc_say('(none)');
+      return;
+    }
+    for (@{$res->{data}}) {
+      my $r = sprintf("Rule %s : %s", $_->{id}, $_->{value});
+      irc_say($r);
+    }
+  };
+}
+
+sub cmd_add_rule {
+  my $r = shift;
+  twitter_call '/2/tweets/search/stream/rules', "{\"add\":[{\"value\":\"$r\"}]}", sub {
+    my $res = decode_json($_[0]);
+    my $done = $res->{meta}{summary}{created};
+    my $status = (defined $done && $done == 1) ? "OK (added '$r')" : $res->{errors}[0]{errors}[0]{message};
+    irc_say($status);
+  };
+}
+
+sub cmd_del_rule {
+  my $id = shift;
+  twitter_call '/2/tweets/search/stream/rules', "{\"delete\":{\"ids\":[\"$id\"]}}", sub {
+    my $res = decode_json($_[0]);
+    my $done = $res->{meta}{summary}{deleted};
+    my $status = (defined $done && $done == 1) ? "OK (delete $id)" : $res->{errors}[0]{errors}[0]{message};
+    irc_say($status);
+  };
+}
+
+
+#
+# IRC client setup and callbacks
+#
+
+sub irc_say {
+  my $text = shift;
+
+  $text =~ s/(\s*\r?\n)+/ - /g;
+  print "> ".substr($text,0,80)."\n";
+  $irc->send_srv(PRIVMSG => $conf{irc_chan}, $text);
+}
+
+sub irc_command {
+  my $cmd = shift;
+  print "\n< $cmd\n";
+
+  if    ($cmd =~ /^help/i)  { cmd_help(); }
+  elsif ($cmd =~ /^get/i)   { cmd_get_rules(); }
+  elsif ($cmd =~ s/add //i) { cmd_add_rule($cmd); }
+  elsif ($cmd =~ s/del //i) { cmd_del_rule($cmd); }
+  else                      { cmd_unknown(); }
+}
+
+$irc->reg_cb(registered => sub {
+  print "Registered, joining $conf{irc_chan}\n";
+  $irc->send_srv('JOIN', $conf{irc_chan});
+});
+
+$irc->reg_cb(join => sub {
+  my (undef, $who, $chan, $myself) = @_;
+  print "Joined $chan\n" if $myself;
+  print "Starting streaming Twitter messages ...\n";
+  twitter_stream();
+});
+
+$irc->reg_cb(disconnect => sub {
+  print "Quitting.\n";
+  $end->broadcast;
+});
+
+$irc->reg_cb (publicmsg => sub {
+  my (undef, $chan, $msg) = @_;
+  my $text = $msg->{'params'}[1];
+  irc_command($text) if $text =~ s/^$conf{irc_nick}\s*[:,]?\s*//;
+});
+
+
+if (@ARGV != 1) {
+  print STDERR "Usage: twitbot path/to/twitbot.cfg\n";
+  exit 1;
+}
+
+open(my $conffh, '<', $ARGV[0]) or die $ARGV[0].": $!";
+while (<$conffh>) {
+  $conf{$1} = $2 if /^(?!#)([a-z_]+)\s*=\s*(.*?)\s*$/;
+}
+close($conffh);
+
+print "Connecting on $conf{irc_server}:$conf{irc_port} as '$conf{irc_nick}'",
+  " (TLS:".($conf{irc_tls} ? "yes" : "no"),
+  ", password:".($conf{irc_pass} ne '' ? "yes" : "no"),
+  ") ...\n";
+$irc->enable_ssl if $conf{irc_tls};
+$irc->connect ($conf{irc_server}, $conf{irc_port}, { timeout => 5, password => $conf{irc_pass}, nick => $conf{irc_nick} });
+$end->wait;
+$irc->disconnect;
