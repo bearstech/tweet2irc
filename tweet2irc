@@ -38,6 +38,7 @@ my %conf = (
   irc_nick   => 'your_nick',
   irc_chan   => '#your_chan',
   rate_limit => 60,  # In message/min
+  show_url   => 0,
 );
 my %history;  # Message hash for de-dupe
 my %limit = (last => 0, bucket => 0);
@@ -71,8 +72,8 @@ sub twitter_stream {
       });
       $handle->on_read(sub {
         $handle->push_read(line => sub {
-	  my $line = $_[1];
-	  return if $line !~ /{/; # Only keep lines with a JSON object
+          my $line = $_[1];
+          return if $line !~ /{/; # Only keep lines with a JSON object
 
           # Opportunistic message de-dupe cache flush
           my $now = time;
@@ -80,16 +81,18 @@ sub twitter_stream {
             delete $history{$k} if $now - $t >= 86400;
           }
 
-	  my $tweet = decode_json($line);
+          my $tweet = decode_json($line);
           my $msg   = $tweet->{data}{text};
           return if defined $history{$msg};  # Already relayed
 
           $limit{bucket} += ($now - $limit{last})*$conf{rate_limit}/60;  # Fill token bucket
           $limit{bucket} = min $limit{bucket}, $conf{rate_limit}/10;     # Set bucket size (burst) to 10% of rate_limit
           $limit{last} = $now;
-	  return if $limit{bucket} < 1;  # Skipping because of rate limit
+          return if $limit{bucket} < 1;  # Skipping because of rate limit
 
-          irc_say(Encode::encode_utf8($msg));
+          my $irc_msg = Encode::encode_utf8($msg);
+          $irc_msg .= " https://twitter.com/twitter/status/".$tweet->{data}{id} if $conf{show_url};
+          irc_say($irc_msg);
           $history{$msg} = $now;
           $limit{bucket}--;
         });
@@ -197,7 +200,7 @@ $irc->reg_cb (publicmsg => sub {
 
 
 if (@ARGV != 1) {
-  print STDERR "Usage: twitbot path/to/twitbot.cfg\n";
+  print STDERR "Usage: tweet2irc path/to/my.cfg\n";
   exit 1;
 }
 
