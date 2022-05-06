@@ -159,8 +159,11 @@ sub cmd_del_rule {
 sub irc_say {
   my $text = shift;
 
-  $text =~ s/(\s*\r?\n)+/ - /g;
-  print "> ".substr($text,0,80)."\n";
+  $text =~ s/(\s*\r?\n)+/ /g;         # Replace newlines with a simple space
+  my $short = substr($text, 0, 500);  # ngircd: Request too long (connection 10): 844 bytes (max. 512 expected)!
+  $text = $short."[...]" if strlen($short) < strlen($text);
+
+  print "> $text\n";
   $irc->send_srv(PRIVMSG => $conf{irc_chan}, $text);
 }
 
