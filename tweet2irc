@@ -50,8 +50,17 @@ sub twitter_call {
   my ($endpoint, $payload, $cb) = @_;
   my $url = 'https://api.twitter.com' . $endpoint;
 
+  my $cb_err = sub {
+    my ($data, $headers) = @_;
+    if (!defined $data || $headers->{Status} >= 400) {
+      printf "error: %s: status=%s, reason=%s\n", $url, $headers->{Status}, $headers->{Reason};
+      return undef;
+    }
+    $cb->($data, $headers);
+  };
+
   if (defined $payload) {
-    http_post $url, $payload, timeout => 3, headers => { 'Authorization' => "Bearer $conf{bearer}", 'Content-Type' => 'application/json' }, $cb;
+    http_post $url, $payload, timeout => 3, headers => { 'Authorization' => "Bearer $conf{bearer}", 'Content-Type' => 'application/json' }, $cb_err;
   } else {
     http_get $url, timeout => 3, headers => { 'Authorization' => "Bearer $conf{bearer}" }, $cb;
   }
@@ -133,6 +142,7 @@ sub cmd_get_rules {
 
 sub cmd_add_rule {
   my $r = shift;
+
   twitter_call '/2/tweets/search/stream/rules', "{\"add\":[{\"value\":\"$r\"}]}", sub {
     my $res = decode_json($_[0]);
     my $done = $res->{meta}{summary}{created};
@@ -213,6 +223,7 @@ while (<$conffh>) {
 }
 close($conffh);
 
+$| = 1;
 print "Connecting on $conf{irc_server}:$conf{irc_port} as '$conf{irc_nick}'",
   " (TLS:".($conf{irc_tls} ? "yes" : "no"),
   ", password:".($conf{irc_pass} ne '' ? "yes" : "no"),
